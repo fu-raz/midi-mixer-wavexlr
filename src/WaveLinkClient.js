@@ -227,6 +227,7 @@ class WaveLinkClient {
 
     this.rpc.on("channelsChanged", ["channels"], (channels) => {
       this.setChannels(channels)
+      this.emit("channelsChanged")
     })
 
     return this.getApplicationInfo()
@@ -420,6 +421,18 @@ class WaveLinkClient {
       this.output.streamVolOut = streamVol
       this.setOutputMixer()
     }
+  }
+
+  setOutputVolume(slider, targetVol, muted) {
+    if (slider == "local") {
+      this.output.localVolOut = targetVol
+      this.output.isLocalMuteOut = undefined !== muted ? muted : false
+    } else {
+      this.output.streamVolOut = targetVol
+      this.output.isStreamMuteOut = undefined !== muted ? muted : false
+    }
+
+    return this.setOutputMixer()
   }
 
   setVolume(mixerTyp, mixerId, slider, targetVol, delay) {

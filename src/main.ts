@@ -62,20 +62,30 @@ export interface FilterFromEvent {
   pluginID: string
 }
 
-async function connectWithRetry(client: WaveLinkClient) {
-  // NB: Every retry we move forward one port, 21 retries will
-  // cycle the entire list twice
-  let retries = 21
+export function delay(ms: number) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
 
-  while (retries > 0) {
+async function connectWithRetry(client: WaveLinkClient) {
+  // NB: Every retry we move forward one port with a total
+  // of 10 possibilities
+  let retries = 4 * 10
+
+  while (retries >= 0) {
     try {
       await client.tryToConnect()
-      return false
+      return true
     } catch (e) {
       client.reconnect()
-      retries--
 
+      retries--
       if (retries < 0) throw e
+
+      // NB: If we have cycled through all ports, give it a longer delay;
+      // if not, just give it a jittered pause
+      await delay(retries % 10 == 0 ? 30 * 1000 : Math.random() * 250)
     }
   }
 
@@ -91,8 +101,100 @@ function volumeWaveLinkToMM(vol: number) {
 }
 
 const mixerTypes = ["local", "stream"]
-let mixerMap: Record<string, { mixer: Mixer; assignment: Assignment }>
+let mixerMap: Record<
+  string,
+  { mixer: Mixer | undefined; assignment: Assignment }
+>
 const buttonList: Record<string, ButtonType> = {}
+
+function createMixerAssignment(
+  client: WaveLinkClient,
+  mixer: Mixer,
+  type: string
+) {
+  const name = `${mixer.mixId}_${type}`
+  const friendlyType = type === "local" ? "Headphone" : "Stream"
+  const isLocal = type === "local"
+
+  const [muted, volume] = isLocal
+    ? [mixer.isLocalInMuted, mixer.localVolumeIn]
+    : [mixer.isStreamInMuted, mixer.streamVolumeIn]
+
+  const assign = new Assignment(name, {
+    name: `${mixer.mixerName} - ${friendlyType}`,
+    muted,
+    volume: volumeWaveLinkToMM(volume),
+  })
+
+  // Set volume even harder
+  setTimeout(() => {
+    assign.volume = volumeWaveLinkToMM(volume)
+  }, 100)
+
+  assign.on("volumeChanged", (level: number) => {
+    client.setVolume("input", mixer.mixId, type, volumeMMToWaveLink(level))
+    assign.volume = level
+  })
+
+  assign.on("mutePressed", () => {
+    client.setMute("input", mixer.mixId, type)
+    assign.muted = isLocal ? mixer.isLocalInMuted : mixer.isStreamInMuted
+  })
+
+  return { id: name, assignment: assign }
+}
+
+// Set up toggle buttons
+function createButton(
+  id: string,
+  data: ButtonTypeData,
+  pressed: (b: ButtonType) => unknown
+) {
+  const btn = new ButtonType(id, data)
+  btn.on("pressed", () => pressed(btn))
+  buttonList[id] = btn
+}
+
+function createFilterButton(
+  client: WaveLinkClient,
+  mixer: Mixer,
+  filter: Filter
+) {
+  createButton(
+    `${mixer.mixId}_${filter.filterID}`,
+    {
+      name: `${filter.name} on ${mixer.mixerName}`,
+      active: filter.active,
+    },
+    (b) => {
+      client.setFilter(mixer.mixId, filter.filterID)
+      filter.active = b.active
+    }
+  )
+}
+
+async function rebuildMixerMap(client: WaveLinkClient) {
+  return (await client.getMixers()).reduce(
+    (
+      acc: Record<string, { mixer: Mixer; assignment: Assignment }>,
+      mixer: Mixer
+    ) => {
+      // For each mixer, we create a fader for both the headphone and stream
+      // output
+      mixerTypes.forEach((type) => {
+        const assign = createMixerAssignment(client, mixer, type)
+        acc[assign.id] = { mixer, assignment: assign.assignment }
+      })
+
+      mixer.filters.forEach((f) => {
+        createFilterButton(client, mixer, f)
+      })
+
+      return acc
+    },
+    {}
+  )
+}
 
 async function initialize() {
   const client = new WaveLinkClient("windows")
@@ -107,84 +209,11 @@ async function initialize() {
     $MM.showNotification(`Couldn't connect to Wave Link software! ${e}`)
   }
 
-  // Set up toggle buttons
-  const createButton = (
-    id: string,
-    data: ButtonTypeData,
-    pressed: (b: ButtonType) => unknown
-  ) => {
-    const btn = new ButtonType(id, data)
-    btn.on("pressed", () => pressed(btn))
-    buttonList[id] = btn
-  }
-
   //
   // Set up fader assignments
   //
 
-  mixerMap = (await client.getMixers()).reduce(
-    (
-      acc: Record<string, { mixer: Mixer; assignment: Assignment }>,
-      mixer: Mixer
-    ) => {
-      // For each mixer, we create a fader for both the headphone and stream
-      // output
-      mixerTypes.forEach((type) => {
-        const name = `${mixer.mixId}_${type}`
-        const friendlyType = type === "local" ? "Headphone" : "Stream"
-        const isLocal = type === "local"
-
-        const [muted, volume] = isLocal
-          ? [mixer.isLocalInMuted, mixer.localVolumeIn]
-          : [mixer.isStreamInMuted, mixer.streamVolumeIn]
-
-        const assign = new Assignment(name, {
-          name: `${mixer.mixerName} - ${friendlyType}`,
-          muted,
-          volume: volumeWaveLinkToMM(volume),
-        })
-
-        // Set volume even harder
-        setTimeout(() => {
-          assign.volume = volumeWaveLinkToMM(volume)
-        }, 100)
-
-        assign.on("volumeChanged", (level: number) => {
-          client.setVolume(
-            "input",
-            mixer.mixId,
-            type,
-            volumeMMToWaveLink(level)
-          )
-          assign.volume = level
-        })
-
-        assign.on("mutePressed", () => {
-          client.setMute("input", mixer.mixId, type)
-          assign.muted = isLocal ? mixer.isLocalInMuted : mixer.isStreamInMuted
-        })
-
-        acc[name] = { mixer, assignment: assign }
-      })
-
-      mixer.filters.forEach((f) => {
-        createButton(
-          `${mixer.mixId}_${f.filterID}`,
-          {
-            name: `${f.name} on ${mixer.mixerName}`,
-            active: f.active,
-          },
-          (b) => {
-            client.setFilter(mixer.mixId, f.filterID)
-            f.active = b.active
-          }
-        )
-      })
-
-      return acc
-    },
-    {}
-  )
+  mixerMap = await rebuildMixerMap(client)
 
   // Monitor mixer level changes from Wave Link and update the faders
   //
@@ -226,8 +255,75 @@ async function initialize() {
     }
   )
 
+  // Channel is added or deleted
+  client.event!.on("channelsChanged", async () => {
+    // Removing all assignments
+    Object.keys(mixerMap).forEach((mixerName) => {
+      mixerMap[mixerName].assignment.remove()
+    })
+
+    // Adding all assignments
+    mixerMap = await rebuildMixerMap(client)
+  })
+
   console.log(`Found ${Object.keys(mixerMap).length} mixers`)
   console.log(mixerMap)
+
+  // Volume sliders for output mix
+  // Get current output volumes
+  const outputVolume = await client.getMonitoringState()
+
+  // Set up sliders for final headphone and stream output
+  const localAndStream = [true, false]
+
+  localAndStream.forEach((isLocal) => {
+    // Create slider for monitor output
+    const mixerVolume = isLocal
+      ? outputVolume.localVolOut
+      : outputVolume.streamVolOut
+
+    const mixerMuted = isLocal
+      ? outputVolume.isLocalMuteOut
+      : outputVolume.isStreamMuteOut
+
+    const mixer = new Assignment(
+      `wavelink_monitor_${isLocal ? "local" : "stream"}_volume`,
+      {
+        name: isLocal ? `Monitor Mix Volume` : `Stream Mix Volume`,
+        muted: mixerMuted,
+        volume: volumeWaveLinkToMM(mixerVolume),
+      }
+    )
+
+    // Set volume even harder
+    setTimeout(() => {
+      mixer.volume = volumeWaveLinkToMM(mixerVolume)
+      mixer.muted = mixerMuted
+    }, 100)
+
+    const volType = isLocal ? "local" : "stream"
+    mixer.on("volumeChanged", (level: number) => {
+      client.setOutputVolume(volType, volumeMMToWaveLink(level))
+    })
+
+    mixer.on("mutePressed", () => {
+      client.setMute("output", null, volType)
+      mixer.muted = client.output!.isLocalMuteOut
+    })
+
+    client.event!.on("outputMixerChanged", () => {
+      if (client.output) {
+        mixer.volume = volumeWaveLinkToMM(
+          isLocal ? client.output.localVolOut : client.output.streamVolOut
+        )
+        mixer.muted = isLocal
+          ? client.output.isLocalMuteOut
+          : client.output.isStreamMuteOut
+      }
+    })
+
+    mixerMap[mixer.id] = { mixer: undefined, assignment: mixer }
+  })
 }
 
 initialize().then(() => console.log("started!"))
